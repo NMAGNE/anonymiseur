@@ -297,6 +297,39 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
     if (r2 <= r1 || c2 <= c1) return null;
     return { r: r1, c: c1, rows: r2 - r1, cols: c2 - c1 };
   }
+  function areaRows(a) { return a.rows !== undefined ? a.rows : a.values.length; }
+  function areaCols(a) { return a.cols !== undefined ? a.cols : (a.values[0] ? a.values[0].length : 0); }
+  function anyOverlap(areas) {
+    for (var i = 0; i < areas.length; i++)
+      for (var j = i + 1; j < areas.length; j++) {
+        var a = areas[i], b = areas[j];
+        if (a.r < b.r + areaRows(b) && b.r < a.r + areaRows(a) && a.c < b.c + areaCols(b) && b.c < a.c + areaCols(a)) return true;
+      }
+    return false;
+  }
+  /** Découpe une plage en blocs de lignes d'au plus maxCells cellules (lecture et écriture par morceaux). */
+  function splitArea(a, maxCells) {
+    var per = Math.max(1, Math.floor(maxCells / a.cols)), out = [];
+    for (var r = 0; r < a.rows; r += per) out.push({ r: a.r + r, c: a.c, rows: Math.min(per, a.rows - r), cols: a.cols });
+    return out;
+  }
+  function chunkPatch(p, maxCells) {
+    var cols = p.values[0].length, per = Math.max(1, Math.floor(maxCells / cols)), out = [];
+    for (var r = 0; r < p.values.length; r += per) out.push({ r: p.r + r, c: p.c, values: p.values.slice(r, r + per) });
+    return out;
+  }
+  /** Réduit un patch au rectangle qui contient réellement des modifications. */
+  function trimPatch(p) {
+    var r1 = -1, r2 = -1, c1 = Infinity, c2 = -1;
+    p.values.forEach(function (row, i) {
+      for (var j = 0; j < row.length; j++) if (row[j] !== null) {
+        if (r1 < 0) r1 = i;
+        r2 = i; if (j < c1) c1 = j; if (j > c2) c2 = j;
+      }
+    });
+    if (r1 < 0) return null;
+    return { r: p.r + r1, c: p.c + c1, values: p.values.slice(r1, r2 + 1).map(function (row) { return row.slice(c1, c2 + 1); }) };
+  }
   function secretName(name) {
     if (isSecretName(name)) return name;
     return String(name).slice(0, 31 - SECRET_SUFFIX.length) + SECRET_SUFFIX;
@@ -378,7 +411,7 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
    */
   function anonymise(input, st) {
     var includeNumbers = !!input.includeNumbers;
-    var seen = new Set(), uniques = new Set(), patches = [];
+    var seen = anyOverlap(input.areas) ? new Set() : null, uniques = new Set(), patches = [];
     var stats = { areas: input.areas.length, cells: 0, uniques: 0, created: 0, reused: 0, alreadyAlias: 0 };
     input.areas.forEach(function (area) {
       var types = area.types || inferTypes(area.values);
@@ -388,10 +421,10 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
         var prow = [];
         for (var j = 0; j < area.values[i].length; j++) {
           var v = area.values[i][j], t = types[i][j], out = null;
-          var cellKey = (area.r + i) + ',' + (area.c + j);
           var eligible = (t === 'String' && v !== '') || (includeNumbers && isNumberType(t));
-          if (eligible && !seen.has(cellKey)) {
-            seen.add(cellKey);
+          var cellKey = (eligible && seen) ? (area.r + i) + ',' + (area.c + j) : null;
+          if (eligible && !(seen && seen.has(cellKey))) {
+            if (seen) seen.add(cellKey);
             if (t === 'String' && st.byAlias.has(v)) {
               stats.alreadyAlias++;
             } else {
@@ -421,18 +454,32 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
 
   /* ---------- Désanonymisation ---------- */
   function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+  function byLengthDesc(a, b) { return b.length - a.length; }
   function aliasRegex(st) {
-    var list = Array.from(st.byAlias.keys()).sort(function (a, b) { return b.length - a.length; });
-    if (!list.length) return null;
-    // (?!\d) : « Salarié #1 » ne doit pas être reconnu à l'intérieur de « Salarié #12 »
-    return new RegExp('(?:' + list.map(escapeRe).join('|') + ')(?!\\d)', 'g');
+    if (st._re !== undefined && st._reSize === st.rows.length) return st._re;
+    var labels = new Set(), literals = [], parts = [];
+    st.byAlias.forEach(function (orig, alias) {
+      var m = ALIAS_RE.exec(alias);
+      if (m) labels.add(m[1]); else literals.push(alias);
+    });
+    // Le motif porte sur les libellés (« Salarié #<nombre> ») : son coût ne dépend pas du nombre d'alias.
+    // \d+(?!\d) lit le numéro en entier : « Salarié #1 » n'est jamais reconnu à l'intérieur de « Salarié #12 ».
+    var ls = Array.from(labels).sort(byLengthDesc).map(escapeRe);
+    if (ls.length) parts.push('(?:' + ls.join('|') + ') #\\d+(?!\\d)');
+    literals.sort(byLengthDesc).forEach(function (l) { parts.push(escapeRe(l)); });
+    st._re = parts.length ? new RegExp(parts.join('|'), 'g') : null;
+    st._reSize = st.rows.length;
+    return st._re;
+  }
+  function swapAlias(st) {
+    return function (m) { return st.byAlias.has(m) ? String(st.byAlias.get(m)) : m; };
   }
   /**
    * Remplace les alias par leur valeur d'origine : cellule entière (type d'origine restitué)
    * ou alias cité dans un texte (retour d'une IA collé dans le classeur).
    */
   function restore(input, st) {
-    var re = aliasRegex(st), patches = [];
+    var re = aliasRegex(st), swap = swapAlias(st), patches = [];
     var stats = { cells: 0, exact: 0, inText: 0 };
     if (!re) return { patches: patches, stats: stats };
     input.areas.forEach(function (area) {
@@ -448,7 +495,7 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
               stats.exact++;
             } else if (v.indexOf(' #') !== -1) {
               re.lastIndex = 0;
-              var replaced = v.replace(re, function (m) { return String(st.byAlias.get(m)); });
+              var replaced = v.replace(re, swap);
               if (replaced !== v) { out = replaced; stats.inText++; }
             }
           }
@@ -465,7 +512,7 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
   function restoreText(text, st) {
     var re = aliasRegex(st);
     if (!re) return text;
-    return String(text).replace(re, function (m) { return String(st.byAlias.get(m)); });
+    return String(text).replace(re, swapAlias(st));
   }
 
   /* ---------- Écriture dans Excel ---------- */
@@ -508,6 +555,7 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
     TABLE_SHEET: TABLE_SHEET, SECRET_SUFFIX: SECRET_SUFFIX, TABLE_FIRST_DATA_ROW: TABLE_FIRST_DATA_ROW,
     TABLE_WARNING: TABLE_WARNING, TABLE_HEADERS: TABLE_HEADERS,
     colLetter: colLetter, a1: a1, areaAddress: areaAddress, clipArea: clipArea,
+    splitArea: splitArea, chunkPatch: chunkPatch, trimPatch: trimPatch,
     secretName: secretName, isSecretName: isSecretName,
     inferTypes: inferTypes, keyOf: keyOf, cleanLabel: cleanLabel, columnsFromHeader: columnsFromHeader,
     emptyState: emptyState, parseTable: parseTable,
@@ -523,6 +571,8 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
  * Anonymiseur Finasens — écriture d'un classeur .xlsx minimal (un seul onglet)
  * Sert à « Extraire l'onglet anonymisé » : valeurs, types, formats de nombre, largeurs de colonnes.
  * Aucune métadonnée d'auteur, aucune formule, aucune autre feuille.
+ * L'onglet est écrit bloc par bloc et compressé au fil de l'eau : la mémoire utilisée ne dépend pas
+ * de la taille de la feuille.
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -530,7 +580,7 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  /* ---------- ZIP sans compression ---------- */
+  /* ---------- Octets ---------- */
   var CRC_TABLE = (function () {
     var t = new Uint32Array(256);
     for (var n = 0; n < 256; n++) {
@@ -540,33 +590,43 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
     }
     return t;
   })();
-  function crc32(u8) {
-    var c = 0xFFFFFFFF;
+  /** CRC-32 cumulable : crcUpdate(crcUpdate(0xFFFFFFFF, a), b) puis crcEnd. */
+  function crcUpdate(c, u8) {
     for (var i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
-    return (c ^ 0xFFFFFFFF) >>> 0;
+    return c;
   }
+  function crcEnd(c) { return (c ^ 0xFFFFFFFF) >>> 0; }
+  var ENC = (typeof TextEncoder !== 'undefined') ? new TextEncoder() : null;
   function utf8(s) {
-    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s);
+    if (ENC) return ENC.encode(s);
     var e = unescape(encodeURIComponent(s)), u = new Uint8Array(e.length);
     for (var i = 0; i < e.length; i++) u[i] = e.charCodeAt(i);
     return u;
   }
-  function zipStore(files) {
+  function concat(chunks, size) {
+    var out = new Uint8Array(size), p = 0;
+    chunks.forEach(function (u) { out.set(u, p); p += u.length; });
+    return out;
+  }
+
+  /* ---------- ZIP ---------- */
+  /** files : [{ name, data (octets tels qu'archivés), crc, size (taille d'origine), method (0 ou 8) }] */
+  function zip(files) {
     var chunks = [], central = [], offset = 0;
     function push(u8) { chunks.push(u8); offset += u8.length; }
     files.forEach(function (f) {
-      var name = utf8(f.name), data = f.data, crc = crc32(data);
+      var name = utf8(f.name);
       var h = new DataView(new ArrayBuffer(30));
       h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
-      h.setUint16(8, 0, true); h.setUint16(10, 0, true); h.setUint16(12, 0x21, true);
-      h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true);
+      h.setUint16(8, f.method, true); h.setUint16(10, 0, true); h.setUint16(12, 0x21, true);
+      h.setUint32(14, f.crc, true); h.setUint32(18, f.data.length, true); h.setUint32(22, f.size, true);
       h.setUint16(26, name.length, true); h.setUint16(28, 0, true);
       var at = offset;
-      push(new Uint8Array(h.buffer)); push(name); push(data);
+      push(new Uint8Array(h.buffer)); push(name); push(f.data);
       var c = new DataView(new ArrayBuffer(46));
       c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true);
-      c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true); c.setUint16(12, 0, true); c.setUint16(14, 0x21, true);
-      c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true);
+      c.setUint16(8, 0x0800, true); c.setUint16(10, f.method, true); c.setUint16(12, 0, true); c.setUint16(14, 0x21, true);
+      c.setUint32(16, f.crc, true); c.setUint32(20, f.data.length, true); c.setUint32(24, f.size, true);
       c.setUint16(28, name.length, true); c.setUint32(42, at, true);
       central.push(new Uint8Array(c.buffer)); central.push(name);
     });
@@ -576,15 +636,47 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
     e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
     e.setUint32(12, cdSize, true); e.setUint32(16, cdStart, true);
     push(new Uint8Array(e.buffer));
-    var out = new Uint8Array(offset), p = 0;
-    chunks.forEach(function (u) { out.set(u, p); p += u.length; });
-    return out;
+    return concat(chunks, offset);
+  }
+  function stored(name, text) {
+    var data = utf8(text);
+    return { name: name, data: data, crc: crcEnd(crcUpdate(0xFFFFFFFF, data)), size: data.length, method: 0 };
+  }
+
+  /* ---------- Compression au fil de l'eau ---------- */
+  function canCompress() {
+    if (typeof CompressionStream === 'undefined') return false;
+    try { new CompressionStream('deflate-raw'); return true; } catch (e) { return false; }
+  }
+  function makeSink(compress) {
+    var chunks = [], size = 0;
+    if (compress && canCompress()) {
+      var cs = new CompressionStream('deflate-raw');
+      var writer = cs.writable.getWriter(), reader = cs.readable.getReader();
+      var pump = (async function () {
+        for (;;) {
+          var r = await reader.read();
+          if (r.done) break;
+          chunks.push(r.value); size += r.value.length;
+        }
+      })();
+      return {
+        method: 8,
+        write: function (u8) { return writer.write(u8); },
+        close: async function () { await writer.close(); await pump; return concat(chunks, size); }
+      };
+    }
+    return {
+      method: 0,
+      write: function (u8) { chunks.push(u8); size += u8.length; return Promise.resolve(); },
+      close: function () { return Promise.resolve(concat(chunks, size)); }
+    };
   }
 
   /* ---------- XML ---------- */
   function esc(s) {
     return String(s)
-      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, '')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
   function colLetter(c) {
@@ -593,104 +685,140 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
     return s;
   }
   var ERRORS = { '#DIV/0!': 1, '#N/A': 1, '#NAME?': 1, '#NULL!': 1, '#NUM!': 1, '#REF!': 1, '#VALUE!': 1 };
+  var NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  var REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  var XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
 
-  /**
-   * opts : { sheetName, values (2D), types? (2D, types Excel), numberFormats? (2D), colWidths? (en caractères) }
-   */
-  function buildXlsx(opts) {
-    var values = opts.values, types = opts.types, formats = opts.numberFormats;
-    var fmtIndex = { 'General': 0 }, fmtList = ['General'];
-    function styleOf(i, j) {
-      var f = formats && formats[i] ? formats[i][j] : null;
-      if (!f || f === 'General') return 0;
-      if (!(f in fmtIndex)) { fmtIndex[f] = fmtList.length; fmtList.push(f); }
-      return fmtIndex[f];
-    }
-    var rowsXml = [];
-    for (var i = 0; i < values.length; i++) {
-      var cells = [];
-      for (var j = 0; j < values[i].length; j++) {
-        var v = values[i][j];
-        if (v === null || v === undefined || v === '') continue;
-        var t = types && types[i] ? types[i][j] : null;
-        var ref = colLetter(j) + (i + 1), s = styleOf(i, j), sAttr = s ? ' s="' + s + '"' : '';
-        if (typeof v === 'number' && isFinite(v)) {
-          cells.push('<c r="' + ref + '"' + sAttr + '><v>' + v + '</v></c>');
-        } else if (typeof v === 'boolean') {
-          cells.push('<c r="' + ref + '" t="b"' + sAttr + '><v>' + (v ? 1 : 0) + '</v></c>');
-        } else if (t === 'Error' && ERRORS[v]) {
-          cells.push('<c r="' + ref + '" t="e"' + sAttr + '><v>' + esc(v) + '</v></c>');
-        } else {
-          cells.push('<c r="' + ref + '" t="inlineStr"' + sAttr + '><is><t xml:space="preserve">' + esc(v) + '</t></is></c>');
+  function makeStyles() {
+    var index = { 'General': 0 }, list = ['General'];
+    return {
+      of: function (f) {
+        if (!f || f === 'General') return 0;
+        var i = index[f];
+        if (i === undefined) { i = index[f] = list.length; list.push(f); }
+        return i;
+      },
+      xml: function () {
+        var numFmts = '', xfs = '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>';
+        if (list.length > 1) {
+          var nf = [];
+          for (var k = 1; k < list.length; k++) {
+            nf.push('<numFmt numFmtId="' + (163 + k) + '" formatCode="' + esc(list[k]) + '"/>');
+            xfs += '<xf numFmtId="' + (163 + k) + '" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>';
+          }
+          numFmts = '<numFmts count="' + nf.length + '">' + nf.join('') + '</numFmts>';
         }
+        return XML + '<styleSheet xmlns="' + NS + '">' + numFmts +
+          '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>' +
+          '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>' +
+          '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+          '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+          '<cellXfs count="' + list.length + '">' + xfs + '</cellXfs>' +
+          '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
       }
-      if (cells.length) rowsXml.push('<row r="' + (i + 1) + '">' + cells.join('') + '</row>');
-    }
-    var colsXml = '';
-    if (opts.colWidths && opts.colWidths.length) {
-      var parts = [];
-      opts.colWidths.forEach(function (w, idx) {
-        if (typeof w === 'number' && w > 0)
-          parts.push('<col min="' + (idx + 1) + '" max="' + (idx + 1) + '" width="' + Math.min(255, Math.round(w * 100) / 100) + '" customWidth="1"/>');
-      });
-      if (parts.length) colsXml = '<cols>' + parts.join('') + '</cols>';
-    }
-    var NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
-    var REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
-    var sheetXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-      '<worksheet xmlns="' + NS + '">' + colsXml + '<sheetData>' + rowsXml.join('') + '</sheetData></worksheet>';
-    var numFmts = '', xfs = '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>';
-    if (fmtList.length > 1) {
-      var nf = [];
-      for (var k = 1; k < fmtList.length; k++) {
-        nf.push('<numFmt numFmtId="' + (163 + k) + '" formatCode="' + esc(fmtList[k]) + '"/>');
-        xfs += '<xf numFmtId="' + (163 + k) + '" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>';
+    };
+  }
+  /** XML des lignes d'un bloc. row0 / col0 : position du bloc dans la feuille (index 0). */
+  function rowsXml(values, types, formats, row0, col0, styles) {
+    var out = [];
+    for (var i = 0; i < values.length; i++) {
+      var cells = '', row = values[i], rn = row0 + i + 1;
+      for (var j = 0; j < row.length; j++) {
+        var v = row[j];
+        if (v === null || v === undefined || v === '') continue;
+        var s = styles.of(formats && formats[i] ? formats[i][j] : null);
+        var head = '<c r="' + colLetter(col0 + j) + rn + '"' + (s ? ' s="' + s + '"' : '');
+        if (typeof v === 'number' && isFinite(v)) cells += head + '><v>' + v + '</v></c>';
+        else if (typeof v === 'boolean') cells += head + ' t="b"><v>' + (v ? 1 : 0) + '</v></c>';
+        else if (types && types[i] && types[i][j] === 'Error' && ERRORS[v]) cells += head + ' t="e"><v>' + esc(v) + '</v></c>';
+        else cells += head + ' t="inlineStr"><is><t xml:space="preserve">' + esc(v) + '</t></is></c>';
       }
-      numFmts = '<numFmts count="' + nf.length + '">' + nf.join('') + '</numFmts>';
+      if (cells) out.push('<row r="' + rn + '">' + cells + '</row>');
     }
-    var stylesXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-      '<styleSheet xmlns="' + NS + '">' + numFmts +
-      '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>' +
-      '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>' +
-      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
-      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-      '<cellXfs count="' + fmtList.length + '">' + xfs + '</cellXfs>' +
-      '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
-      '</styleSheet>';
-    var name = String(opts.sheetName || 'Feuil1').replace(/[\\\/\?\*\[\]:]/g, ' ').slice(0, 31);
-    var workbookXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-      '<workbook xmlns="' + NS + '" xmlns:r="' + REL + '"><sheets><sheet name="' + esc(name) + '" sheetId="1" r:id="rId1"/></sheets></workbook>';
-    var files = [
-      { name: '[Content_Types].xml', data: utf8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    return out.join('');
+  }
+  function colsXml(widths) {
+    if (!widths || !widths.length) return '';
+    var parts = [];
+    widths.forEach(function (w, idx) {
+      if (typeof w === 'number' && w > 0)
+        parts.push('<col min="' + (idx + 1) + '" max="' + (idx + 1) + '" width="' + Math.min(255, Math.round(w * 100) / 100) + '" customWidth="1"/>');
+    });
+    return parts.length ? '<cols>' + parts.join('') + '</cols>' : '';
+  }
+  function packageFiles(sheetName, sheetEntry, styles) {
+    var name = String(sheetName || 'Feuil1').replace(/[\\\/\?\*\[\]:]/g, ' ').slice(0, 31);
+    return [
+      stored('[Content_Types].xml', XML +
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
         '<Default Extension="xml" ContentType="application/xml"/>' +
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
         '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
         '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
-        '</Types>') },
-      { name: '_rels/.rels', data: utf8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '</Types>'),
+      stored('_rels/.rels', XML +
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
-        '<Relationship Id="rId1" Type="' + REL + '/officeDocument" Target="xl/workbook.xml"/></Relationships>') },
-      { name: 'xl/workbook.xml', data: utf8(workbookXml) },
-      { name: 'xl/_rels/workbook.xml.rels', data: utf8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationship Id="rId1" Type="' + REL + '/officeDocument" Target="xl/workbook.xml"/></Relationships>'),
+      stored('xl/workbook.xml', XML + '<workbook xmlns="' + NS + '" xmlns:r="' + REL + '"><sheets><sheet name="' + esc(name) +
+        '" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+      stored('xl/_rels/workbook.xml.rels', XML +
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
         '<Relationship Id="rId1" Type="' + REL + '/worksheet" Target="worksheets/sheet1.xml"/>' +
-        '<Relationship Id="rId2" Type="' + REL + '/styles" Target="styles.xml"/></Relationships>') },
-      { name: 'xl/worksheets/sheet1.xml', data: utf8(sheetXml) },
-      { name: 'xl/styles.xml', data: utf8(stylesXml) }
+        '<Relationship Id="rId2" Type="' + REL + '/styles" Target="styles.xml"/></Relationships>'),
+      sheetEntry,
+      stored('xl/styles.xml', styles.xml())
     ];
-    return zipStore(files);
+  }
+
+  /**
+   * Écriture par blocs. opts : { sheetName, colWidths? (en caractères), startRow?, startCol?, compress? }
+   * await w.addRows(values, types?, numberFormats?) autant de fois que nécessaire, puis await w.finish().
+   */
+  function createWriter(opts) {
+    opts = opts || {};
+    var sink = makeSink(opts.compress !== false), styles = makeStyles();
+    var crc = 0xFFFFFFFF, size = 0, row = opts.startRow || 0, col0 = opts.startCol || 0;
+    function emit(text) {
+      var u8 = utf8(text);
+      crc = crcUpdate(crc, u8); size += u8.length;
+      return sink.write(u8);
+    }
+    var started = emit(XML + '<worksheet xmlns="' + NS + '">' + colsXml(opts.colWidths) + '<sheetData>');
+    return {
+      compressed: sink.method === 8,
+      addRows: async function (values, types, formats) {
+        await started;
+        var xml = rowsXml(values, types, formats, row, col0, styles);
+        row += values.length;
+        if (xml) await emit(xml);
+      },
+      finish: async function () {
+        await started;
+        await emit('</sheetData></worksheet>');
+        var data = await sink.close();
+        return zip(packageFiles(opts.sheetName,
+          { name: 'xl/worksheets/sheet1.xml', data: data, crc: crcEnd(crc), size: size, method: sink.method }, styles));
+      }
+    };
+  }
+
+  /** Version directe (petits onglets, sans compression). opts : { sheetName, values, types?, numberFormats?, colWidths? } */
+  function buildXlsx(opts) {
+    var styles = makeStyles();
+    var sheet = stored('xl/worksheets/sheet1.xml', XML + '<worksheet xmlns="' + NS + '">' + colsXml(opts.colWidths) +
+      '<sheetData>' + rowsXml(opts.values, opts.types, opts.numberFormats, 0, 0, styles) + '</sheetData></worksheet>');
+    return zip(packageFiles(opts.sheetName, sheet, styles));
   }
 
   function toBase64(u8) {
     if (typeof Buffer !== 'undefined' && typeof btoa === 'undefined') return Buffer.from(u8).toString('base64');
-    var s = '', CH = 0x8000;
-    for (var i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
-    return btoa(s);
+    var parts = [], CH = 0x6000; // multiple de 3 : les morceaux se concatènent sans remplissage intermédiaire
+    for (var i = 0; i < u8.length; i += CH) parts.push(btoa(String.fromCharCode.apply(null, u8.subarray(i, i + CH))));
+    return parts.join('');
   }
 
-  return { buildXlsx: buildXlsx, toBase64: toBase64 };
+  return { buildXlsx: buildXlsx, createWriter: createWriter, canCompress: canCompress, toBase64: toBase64 };
 });
 
 </script>
@@ -703,8 +831,15 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
 (function () {
   'use strict';
   var E = window.FinasensEngine, X = window.FinasensXlsx;
-  var VERSION = '0.2';
-  var MAX_COUNT_CELLS = 300000;
+  var VERSION = '0.3';
+  var MAX_COUNT_CELLS = 50000;          // au-delà, la sélection n'est plus comptée à chaque clic
+  var READ_CELLS = 100000;              // taille maximale d'un bloc lu dans Excel
+  var WRITE_CELLS = 50000;              // taille maximale d'un bloc écrit dans Excel
+  var COPY_CELLS = 500000;              // taille maximale d'un bloc figé en valeurs
+  var EXCEL_MAX_ROWS = 1048576;
+  var ANONYMISE_MAX_CELLS = 2000000;    // cellules traitées par passage
+  var EXTRACT_MAX_CELLS = 1500000;      // extraction automatique, avec compression
+  var EXTRACT_MAX_CELLS_STORE = 300000; // extraction automatique, sans compression
 
   /* =====================================================================
    * Adaptateur Excel (Office.js)
@@ -734,18 +869,9 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
         });
       }).catch(function () { return null; }); // un graphique ou une image est sélectionné
     },
-    read: function (sheet, areas) {
-      return Excel.run(async function (ctx) {
-        var ws = ctx.workbook.worksheets.getItem(sheet);
-        var ranges = areas.map(function (a) {
-          var g = ws.getRangeByIndexes(a.r, a.c, a.rows, a.cols);
-          g.load('values,valueTypes');
-          return g;
-        });
-        await ctx.sync();
-        return areas.map(function (a, i) {
-          return Object.assign({}, a, { values: ranges[i].values, types: ranges[i].valueTypes });
-        });
+    read: function (sheet, areas, onProgress) {
+      return Excel.run(function (ctx) {
+        return readBlocks(ctx, ctx.workbook.worksheets.getItem(sheet), areas, onProgress);
       });
     },
     readTable: function () {
@@ -757,55 +883,66 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
         used.load('rowIndex,columnIndex,rowCount');
         await ctx.sync();
         if (used.isNullObject) return [];
-        var g = ws.getRangeByIndexes(0, 0, used.rowIndex + used.rowCount, 2);
-        g.load('values');
-        await ctx.sync();
-        return g.values;
+        var out = await readBlocks(ctx, ws, [{ r: 0, c: 0, rows: used.rowIndex + used.rowCount, cols: 2 }]);
+        return out[0].values;
       });
     },
-    writeAnonymised: function (o) {
-      return Excel.run(async function (ctx) {
-        var wss = ctx.workbook.worksheets;
-        var src = wss.getItem(o.source), target = src, targetName = o.source;
-        if (!o.inPlace) {
-          targetName = E.secretName(o.source);
-          var old = wss.getItemOrNullObject(targetName);
-          await ctx.sync();
-          if (!old.isNullObject) { old.delete(); await ctx.sync(); }
-          target = src.copy(Excel.WorksheetPositionType.after, src);
-          target.name = targetName;
-          var su = src.getUsedRangeOrNullObject(false);
-          su.load('rowIndex,columnIndex,rowCount,columnCount');
-          await ctx.sync();
-          if (!su.isNullObject) {
-            // Formules figées en valeurs : l'onglet anonymisé ne dépend plus d'aucune autre feuille
-            target.getRangeByIndexes(su.rowIndex, su.columnIndex, su.rowCount, su.columnCount)
-              .copyFrom(su, Excel.RangeCopyType.values);
+    writeAnonymised: async function (o, onProgress) {
+      var targetName = o.inPlace ? o.source : E.secretName(o.source), created = null;
+      try {
+        await Excel.run(async function (ctx) {
+          var wss = ctx.workbook.worksheets;
+          // 1. La table d'abord : tout alias écrit dans une cellule a déjà sa correspondance enregistrée.
+          await writeTable(ctx, o.tableValues);
+          var src = wss.getItem(o.source), target = src;
+          if (!o.inPlace) {
+            // 2. Copie de l'onglet, puis remplacement de l'ancien onglet anonymisé seulement si la copie a réussi.
+            target = src.copy(Excel.WorksheetPositionType.after, src);
+            target.load('name');
+            await ctx.sync();
+            created = target.name;
+            var old = wss.getItemOrNullObject(targetName);
+            await ctx.sync();
+            if (!old.isNullObject) { old.delete(); await ctx.sync(); }
+            target.name = targetName;
+            var su = src.getUsedRangeOrNullObject(false);
+            su.load('rowIndex,columnIndex,rowCount,columnCount');
+            await ctx.sync();
+            created = targetName;
+            if (!su.isNullObject) {
+              // Formules figées en valeurs, par blocs : l'onglet anonymisé ne dépend plus d'aucune autre feuille
+              var parts = E.splitArea({ r: su.rowIndex, c: su.columnIndex, rows: su.rowCount, cols: su.columnCount }, COPY_CELLS);
+              for (var i = 0; i < parts.length; i++) {
+                var k = parts[i];
+                target.getRangeByIndexes(k.r, k.c, k.rows, k.cols)
+                  .copyFrom(src.getRangeByIndexes(k.r, k.c, k.rows, k.cols), Excel.RangeCopyType.values);
+                await ctx.sync();
+              }
+            }
           }
-        }
-        o.patches.forEach(function (p) {
-          target.getRangeByIndexes(p.r, p.c, p.values.length, p.values[0].length).values = E.protectPatch(p.values);
+          // 3. Alias, par blocs
+          await writePatches(ctx, target, o.patches, onProgress);
+          target.activate();
+          await ctx.sync();
         });
-        await writeTable(ctx, o.tableValues);
-        target.activate();
-        await ctx.sync();
-        return { target: targetName };
-      });
+      } catch (err) {
+        // Jamais d'onglet à moitié anonymisé laissé derrière soi
+        if (created) { await removeSheet(created); err.cleaned = true; }
+        else if (o.inPlace) err.partial = true;
+        throw err;
+      }
+      return { target: targetName };
     },
     writeRestored: function (o) {
-      return Excel.run(async function (ctx) {
-        var ws = ctx.workbook.worksheets.getItem(o.sheet);
-        o.patches.forEach(function (p) {
-          ws.getRangeByIndexes(p.r, p.c, p.values.length, p.values[0].length).values = E.protectPatch(p.values);
-        });
-        await ctx.sync();
+      return Excel.run(function (ctx) {
+        return writePatches(ctx, ctx.workbook.worksheets.getItem(o.sheet), o.patches);
       });
     },
-    extract: async function (sheet) {
-      var data = await Excel.run(async function (ctx) {
+    extract: async function (sheet, onProgress) {
+      var meta = await Excel.run(async function (ctx) {
         var ws = ctx.workbook.worksheets.getItem(sheet);
         var used = ws.getUsedRangeOrNullObject(false);
-        used.load('values,valueTypes,numberFormat,rowIndex,columnIndex,rowCount,columnCount');
+        used.load('rowIndex,columnIndex,rowCount,columnCount');
         await ctx.sync();
         if (used.isNullObject) return null;
         var nCols = Math.min(used.columnIndex + used.columnCount, 400), fmts = [];
@@ -816,15 +953,21 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
         }
         await ctx.sync();
         return {
-          r: used.rowIndex, c: used.columnIndex, values: used.values, types: used.valueTypes, formats: used.numberFormat,
+          r: used.rowIndex, c: used.columnIndex, rows: used.rowCount, cols: used.columnCount,
           widths: fmts.map(function (f) { return f.columnWidth ? Math.max(4, Math.min(80, f.columnWidth / 6)) : null; })
         };
       });
-      if (!data) throw new Error('L’onglet « ' + sheet + ' » est vide.');
-      var bytes = X.buildXlsx({
-        sheetName: sheet, values: pad(data.values, data.r, data.c), types: pad(data.types, data.r, data.c),
-        numberFormats: pad(data.formats, data.r, data.c), colWidths: data.widths
-      });
+      if (!meta) throw friendly('L’onglet « ' + sheet + ' » est vide.');
+      checkExtractSize(sheet, meta.rows * meta.cols);
+      var w = X.createWriter({ sheetName: sheet, colWidths: meta.widths, startRow: meta.r, startCol: meta.c });
+      var blocks = E.splitArea(meta, READ_CELLS), total = meta.rows * meta.cols, done = 0;
+      for (var i = 0; i < blocks.length; i++) {
+        var d = await readForExport(sheet, blocks[i]);
+        await w.addRows(d.values, d.types, d.formats);
+        done += blocks[i].rows * blocks[i].cols;
+        if (onProgress) onProgress(done, total);
+      }
+      var bytes = await w.finish();
       await Excel.createWorkbook(X.toBase64(bytes));
       return { how: 'opened' };
     },
@@ -833,10 +976,55 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
         ctx.workbook.worksheets.onActivated.add(function () { cb('sheet'); return Promise.resolve(); });
         ctx.workbook.onSelectionChanged.add(function () { cb('selection'); return Promise.resolve(); });
         await ctx.sync();
-      }).catch(function () { /* événements indisponibles : le bouton Actualiser reste là */ });
+      }).catch(function () { /* événements indisponibles : le volet se met à jour à chaque action */ });
     }
   };
 
+  /* ---------- Lecture et écriture par blocs (gros onglets) ---------- */
+  /** Lit des plages par blocs d'au plus READ_CELLS cellules : aucune réponse d'Excel ne dépasse cette taille. */
+  async function readBlocks(ctx, ws, areas, onProgress) {
+    var out = areas.map(function (a) { return Object.assign({}, a, { values: [], types: [] }); });
+    var total = areas.reduce(function (n, a) { return n + a.rows * a.cols; }, 0), done = 0;
+    var pending = [], pendingCells = 0;
+    async function flush() {
+      if (!pending.length) return;
+      await ctx.sync();
+      pending.forEach(function (p) {
+        var v = p.range.values, t = p.range.valueTypes;
+        for (var i = 0; i < v.length; i++) { p.dest.values.push(v[i]); p.dest.types.push(t[i]); }
+      });
+      done += pendingCells; pending = []; pendingCells = 0;
+      if (onProgress) onProgress(done, total);
+    }
+    for (var i = 0; i < areas.length; i++) {
+      var blocks = E.splitArea(areas[i], READ_CELLS);
+      for (var b = 0; b < blocks.length; b++) {
+        var k = blocks[b], g = ws.getRangeByIndexes(k.r, k.c, k.rows, k.cols);
+        g.load('values,valueTypes');
+        pending.push({ range: g, dest: out[i] });
+        pendingCells += k.rows * k.cols;
+        if (pendingCells >= READ_CELLS) await flush();
+      }
+    }
+    await flush();
+    return out;
+  }
+  /** Écrit des patchs par blocs d'au plus WRITE_CELLS cellules, avec un envoi à Excel par bloc. */
+  async function writePatches(ctx, ws, patches, onProgress) {
+    var chunks = [];
+    patches.forEach(function (p) { E.chunkPatch(p, WRITE_CELLS).forEach(function (c) { chunks.push(c); }); });
+    var total = chunks.reduce(function (n, c) { return n + c.values.length * c.values[0].length; }, 0), done = 0, pending = 0;
+    for (var i = 0; i < chunks.length; i++) {
+      var c = chunks[i], cells = c.values.length * c.values[0].length;
+      ws.getRangeByIndexes(c.r, c.c, c.values.length, c.values[0].length).values = E.protectPatch(c.values);
+      pending += cells;
+      if (pending >= WRITE_CELLS || i === chunks.length - 1) {
+        await ctx.sync();
+        done += pending; pending = 0;
+        if (onProgress) onProgress(done, total);
+      }
+    }
+  }
   async function writeTable(ctx, tableValues) {
     var wss = ctx.workbook.worksheets;
     var t = wss.getItemOrNullObject(E.TABLE_SHEET);
@@ -851,23 +1039,39 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
       head.format.fill.color = '#161449';
       head.format.font.color = '#FFFFFF';
       head.format.font.bold = true;
+      await ctx.sync();
     }
     var data = tableValues.slice(E.TABLE_FIRST_DATA_ROW);
     if (data.length) {
-      t.getRangeByIndexes(E.TABLE_FIRST_DATA_ROW, 0, data.length, 2).values = E.protectPatch(data);
-      if (isNew) t.getRangeByIndexes(1, 0, data.length + 1, 2).format.autofitColumns();
+      await writePatches(ctx, t, [{ r: E.TABLE_FIRST_DATA_ROW, c: 0, values: data }]);
+      if (isNew) {
+        t.getRangeByIndexes(1, 0, Math.min(data.length, 2000) + 1, 2).format.autofitColumns();
+        await ctx.sync();
+      }
     }
   }
-  function pad(grid, r0, c0) {
-    if (!r0 && !c0) return grid;
-    var out = [], i;
-    for (i = 0; i < r0; i++) out.push([]);
-    grid.forEach(function (row) {
-      var lead = [];
-      for (var j = 0; j < c0; j++) lead.push('');
-      out.push(lead.concat(row));
+  function removeSheet(name) {
+    return Excel.run(async function (ctx) {
+      var ws = ctx.workbook.worksheets.getItemOrNullObject(name);
+      await ctx.sync();
+      if (!ws.isNullObject) { ws.delete(); await ctx.sync(); }
+    }).catch(function () { /* le message d'origine reste celui affiché */ });
+  }
+  function readForExport(sheet, k) {
+    return Excel.run(async function (ctx) {
+      var g = ctx.workbook.worksheets.getItem(sheet).getRangeByIndexes(k.r, k.c, k.rows, k.cols);
+      g.load('values,valueTypes,numberFormat');
+      await ctx.sync();
+      return { values: g.values, types: g.valueTypes, formats: g.numberFormat };
     });
-    return out;
+  }
+  function friendly(message) { var e = new Error(message); e.friendly = true; return e; }
+  function checkExtractSize(sheet, cells) {
+    var limit = X.canCompress() ? EXTRACT_MAX_CELLS : EXTRACT_MAX_CELLS_STORE;
+    if (cells > limit) {
+      throw friendly('Onglet trop volumineux pour l’extraction automatique (' + fr(cells) + ' cellules, limite ' + fr(limit) +
+        '). Faites un clic droit sur l’onglet « ' + sheet + ' », puis « Déplacer ou copier », choisissez « (nouveau classeur) » et cochez « Créer une copie ».');
+    }
   }
   function buildInfo(sheet, names, used) {
     var secrets = names.filter(E.isSecretName);
@@ -999,7 +1203,9 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
       writeRestored: async function (o) { applyPatches(sheet(o.sheet), o.patches); render(); },
       extract: async function (name) {
         var s = sheet(name);
-        var bytes = X.buildXlsx({ sheetName: name, values: s.grid, types: E.inferTypes(s.grid) });
+        var w = X.createWriter({ sheetName: name });
+        await w.addRows(s.grid, E.inferTypes(s.grid));
+        var bytes = await w.finish();
         var url = URL.createObjectURL(new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
         var a = document.createElement('a');
         a.href = url; a.download = name + '.xlsx';
@@ -1117,11 +1323,37 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
     document.body.classList.remove('busy');
     await refresh();
   }
-  function fail(err) {
+  var EXCEL_ERRORS = {
+    InvalidOperationInCellEditMode: 'Une cellule est en cours de saisie. Validez avec Entrée ou annulez avec Échap, puis relancez.',
+    AccessDenied: 'L’onglet ou le classeur est protégé, ou ouvert en lecture seule. Retirez la protection puis relancez.',
+    UnsupportedOperation: 'Excel refuse cette opération sur cette plage (tableau croisé dynamique, plage protégée ou cellules fusionnées).',
+    PivotTableRangeConflict: 'La plage touche un tableau croisé dynamique, qu’Excel ne laisse pas modifier.',
+    MergedRangeConflict: 'La plage coupe des cellules fusionnées. Sélectionnez la zone fusionnée en entier.',
+    ItemAlreadyExists: 'Un onglet porte déjà ce nom.',
+    ItemNotFound: 'L’onglet a été renommé ou supprimé pendant l’opération. Relancez.',
+    RequestPayloadSizeLimitExceeded: 'Plage trop volumineuse pour Excel. Réduisez la sélection et procédez en plusieurs passages.',
+    ResponsePayloadSizeLimitExceeded: 'Plage trop volumineuse pour Excel. Réduisez la sélection et procédez en plusieurs passages.',
+    RangeExceedsLimit: 'Plage trop volumineuse pour Excel. Réduisez la sélection et procédez en plusieurs passages.',
+    MemoryLimitReached: 'Mémoire insuffisante dans Excel pour cette plage. Fermez d’autres classeurs ou réduisez la sélection.'
+  };
+  function explain(err) {
     var msg = (err && err.message) ? err.message : String(err);
-    if (err && err.code === 'ItemAlreadyExists') msg = 'Un onglet porte déjà ce nom.';
-    S.error = msg;
+    if (!err || err.friendly) return msg;
+    var code = err.code || '';
+    var text = EXCEL_ERRORS[code] ? EXCEL_ERRORS[code] + ' (code ' + code + ')'
+      : 'Excel a renvoyé une erreur : ' + msg + (code ? ' (code ' + code + ')' : '');
+    if (err.cleaned) text += ' L’onglet anonymisé incomplet a été supprimé : rien n’est à moitié fait.';
+    if (err.partial) text += ' L’opération s’est interrompue en cours de route : relancez-la, les cellules déjà traitées seront ignorées.';
+    return text;
+  }
+  function fail(err) {
+    S.error = explain(err);
     render();
+  }
+  function progress(label) {
+    return function (done, total) {
+      $('statusText').textContent = label + ' ' + (total ? Math.min(100, Math.round(100 * done / total)) : 100) + ' %';
+    };
   }
   function anonymiseAreas() {
     var u = S.info.used;
@@ -1137,21 +1369,31 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
   function doAnonymise() {
     return run(async function () {
       var info = await adapter.info();
-      if (info.sheet !== S.info.sheet) throw new Error('L’onglet actif a changé. Vérifiez votre choix puis relancez.');
+      if (info.sheet !== S.info.sheet) throw friendly('L’onglet actif a changé. Vérifiez votre choix puis relancez.');
       var areas = anonymiseAreas();
-      if (!areas.length) throw new Error('Aucune plage à traiter dans cet onglet.');
-      var data = await adapter.read(info.sheet, areas);
+      if (!areas.length) throw friendly('Aucune plage à traiter dans cet onglet.');
+      var cells = areas.reduce(function (n, a) { return n + a.rows * a.cols; }, 0);
+      if (cells > ANONYMISE_MAX_CELLS) {
+        throw friendly('Sélection trop volumineuse pour un seul passage (' + fr(cells) + ' cellules, limite ' + fr(ANONYMISE_MAX_CELLS) +
+          '). Traitez une partie des colonnes, puis complétez depuis l’onglet anonymisé.');
+      }
+      var data = await adapter.read(info.sheet, areas, progress('Lecture'));
       data.forEach(function (d, i) { d.label = areas[i].label; });
       var st = E.parseTable(await adapter.readTable());
       var res = E.anonymise({ areas: data, includeNumbers: S.includeNumbers }, st);
       if (!res.stats.cells) {
-        throw new Error(res.stats.alreadyAlias
+        throw friendly(res.stats.alreadyAlias
           ? 'Ces cellules sont déjà anonymisées.'
           : 'Aucune valeur à anonymiser dans la plage choisie' + (S.includeNumbers ? '.' : ' (les nombres sont laissés intacts).'));
       }
+      if (st.rows.length + E.TABLE_FIRST_DATA_ROW > EXCEL_MAX_ROWS) {
+        throw friendly('Trop de valeurs distinctes pour la table de correspondance (' + fr(st.rows.length) +
+          ', pour ' + fr(EXCEL_MAX_ROWS) + ' lignes dans un onglet Excel). Réduisez la sélection.');
+      }
+      $('statusText').textContent = info.isSecret ? 'Écriture' : 'Copie de l’onglet';
       var out = await adapter.writeAnonymised({
         source: info.sheet, inPlace: info.isSecret, patches: res.patches, tableValues: E.tableSheetValues(st)
-      });
+      }, progress('Écriture'));
       S.report = { stats: res.stats, target: out.target, inPlace: info.isSecret, ranges: addresses(areas), when: new Date() };
       S.extracted = null;
       S.view = 'done';
@@ -1160,24 +1402,34 @@ body.demo .pane { min-height: 0; height: 100vh; overflow-y: auto; box-shadow: -6
   function doRestore() {
     return run(async function () {
       var info = await adapter.info();
-      if (info.isTable) throw new Error('Placez-vous sur l’onglet à désanonymiser, pas sur la table.');
-      if (!info.used) throw new Error('Cet onglet est vide.');
+      if (info.isTable) throw friendly('Placez-vous sur l’onglet à désanonymiser, pas sur la table.');
+      if (!info.used) throw friendly('Cet onglet est vide.');
       var areas = S.restoreScope === 'selection'
         ? (await adapter.selection() || []).map(function (a) { return E.clipArea(a, info.used); }).filter(Boolean)
         : [info.used];
-      if (!areas.length) throw new Error('La sélection est vide.');
+      if (!areas.length) throw friendly('La sélection est vide.');
       var st = E.parseTable(await adapter.readTable());
-      var res = E.restore({ areas: await adapter.read(info.sheet, areas) }, st);
-      if (res.patches.length) await adapter.writeRestored({ sheet: info.sheet, patches: res.patches });
-      S.restored = { stats: res.stats, sheet: info.sheet, scope: S.restoreScope, ranges: addresses(areas) };
+      if (!st.rows.length) throw friendly('La table de correspondance de ce classeur est vide.');
+      var blocks = [], stats = { cells: 0, exact: 0, inText: 0 };
+      areas.forEach(function (a) { E.splitArea(a, READ_CELLS).forEach(function (b) { blocks.push(b); }); });
+      var total = blocks.reduce(function (n, b) { return n + b.rows * b.cols; }, 0), done = 0, show = progress('Désanonymisation');
+      for (var i = 0; i < blocks.length; i++) {
+        var res = E.restore({ areas: await adapter.read(info.sheet, [blocks[i]]) }, st);
+        var patches = res.patches.map(E.trimPatch).filter(Boolean);
+        if (patches.length) await adapter.writeRestored({ sheet: info.sheet, patches: patches });
+        stats.cells += res.stats.cells; stats.exact += res.stats.exact; stats.inText += res.stats.inText;
+        done += blocks[i].rows * blocks[i].cols;
+        show(done, total);
+      }
+      S.restored = { stats: stats, sheet: info.sheet, scope: S.restoreScope, ranges: addresses(areas) };
       S.view = 'restored';
     });
   }
   function doExtract(explicit) {
     return run(async function () {
       var name = explicit || extractTarget();
-      if (!name) throw new Error('Placez-vous sur l’onglet anonymisé à extraire.');
-      var out = await adapter.extract(name);
+      if (!name) throw friendly('Placez-vous sur l’onglet anonymisé à extraire.');
+      var out = await adapter.extract(name, progress('Extraction'));
       S.extracted = { sheet: name, how: out.how };
       render();
     });
